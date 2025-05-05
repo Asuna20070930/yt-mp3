@@ -590,11 +590,11 @@ def show_menu(output_dir, ffmpeg_path):
     while True:
         print("\n===== YouTube 影片轉 MP3 下載器 =====")
         print(f"檔案將儲存至: {output_dir}")
-        print("1. 單一影片下載 (輸入 URL)")
-        print("2. 批次下載多個影片 (輸入多個 URL)")
+        print("1. 單一影片下載")
+        print("2. 批次下載多個影片")
         print("3. 通過歌曲名稱下載")
-        print("4. 批次下載多首歌曲 (輸入名稱)")
-        print("5. 從文本文件批量下載 URL")
+        print("4. 批次下載多首歌曲 ")
+        print("5. 從文本文件批量下載 ")
         print("6. 變更儲存目錄")
         print("0. 退出程式")
         

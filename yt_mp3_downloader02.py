@@ -11,6 +11,8 @@ import shutil
 import tempfile
 import zipfile
 from urllib.request import urlretrieve
+from mutagen.mp3 import MP3
+from mutagen.id3 import ID3
 
 def is_admin():
     """檢查程式是否以管理員權限運行"""
@@ -340,20 +342,37 @@ def search_song_fallback(song_name, extra_params=""):
         print(f"備用搜尋時發生錯誤: {str(e)}")
         return None
 
-def download_as_mp3(youtube_url, custom_filename=None, extra_params=""):
-    """從 YouTube URL 下載 MP3"""
+def get_mp3_metadata(file_path):
+    """獲取MP3文件的元數據"""
+    try:
+        # 使用mutagen讀取MP3標籤
+        audio = MP3(file_path, ID3=ID3)
+        if audio.tags is None:
+            return None
+
+        metadata = {
+            'title': str(audio.tags.get('TIT2', '未知標題')),
+            'artist': str(audio.tags.get('TPE1', '未知藝術家')),
+            'album': str(audio.tags.get('TALB', '未知專輯')),
+            'year': str(audio.tags.get('TDRC', '未知年份')),
+            'genre': str(audio.tags.get('TCON', '未知類型')),
+            'duration': format_duration(int(audio.info.length))
+        }
+        return metadata
+    except Exception as e:
+        print(f"讀取ID3標籤時發生錯誤: {str(e)}")
+        return None
+
+def download_as_mp3(youtube_url, extra_params=""):
+    """從 YouTube URL 下載 MP3，並在下載後顯示檔案資訊"""
     try:
         print(f"正在處理: {youtube_url}")
 
         # 使用 yt-dlp 直接下載為 MP3
         output_template = f"{output_dir}/%(title)s.%(ext)s"
-        if custom_filename:
-            # 如果提供了自定義檔名，則使用它
-            sanitized_name = sanitize_filename(custom_filename)
-            output_template = f"{output_dir}/{sanitized_name}.%(ext)s"
 
-        # 添加更多選項以確保音質和完整性
-        command = f'yt-dlp {extra_params} --no-playlist -x --audio-format mp3 --audio-quality 0 --embed-thumbnail --add-metadata -o "{output_template}" "{youtube_url}"'
+        # 使用更輕量級的選項來下載MP3，保留元數據但不下載縮圖
+        command = f'yt-dlp {extra_params} --no-playlist -x --audio-format mp3 --audio-quality 0 --add-metadata --no-embed-thumbnail --no-write-thumbnail -o "{output_template}" "{youtube_url}"'
 
         print("執行下載命令...")
         result = subprocess.run(command, shell=True, capture_output=True, text=True)
@@ -371,38 +390,67 @@ def download_as_mp3(youtube_url, custom_filename=None, extra_params=""):
                 return False
             return False
 
-        print(f"下載完成!")
-        return True
+        # 獲取最新下載的檔案
+        files = glob.glob(f"{output_dir}/*.mp3")
+        if files:
+            latest_file = max(files, key=os.path.getctime)
+            filename = os.path.basename(latest_file)
+            
+            # 從檔案本身獲取ID3標籤資訊
+            print("\n下載完成!")
+            print(f"檔案名稱: {filename}")
+            
+            # 從檔案本身讀取標籤資訊
+            metadata = get_mp3_metadata(latest_file)
+            if metadata:
+                print(f"標題: {metadata['title']}")
+                print(f"演出者: {metadata['artist']}")
+                if metadata['album'] != '未知專輯':
+                    print(f"專輯: {metadata['album']}")
+            
+            # 直接詢問新檔名，如果輸入為空則保持原檔名
+            new_name = input("請輸入新檔名（直接按Enter保持原檔名，無需.mp3副檔名）: ")
+            if new_name:
+                new_filepath = f"{output_dir}/{sanitize_filename(new_name)}.mp3"
+                try:
+                    os.rename(latest_file, new_filepath)
+                    print(f"已重新命名為: {os.path.basename(new_filepath)}")
+                except Exception as e:
+                    print(f"重新命名檔案時發生錯誤: {str(e)}")
+            
+            return True
+        else:
+            print("找不到下載的檔案。")
+            return False
+            
     except Exception as e:
         print(f"下載時發生錯誤: {str(e)}")
         return False
 
 def select_from_search_results(song_name, extra_params=""):
-    """讓使用者從搜尋結果中選擇影片，排除過長和過短的影片"""
+    """讓用戶從搜尋結果中選擇一個影片"""
     try:
         print(f"正在搜尋: {song_name}")
-
-        # 搜尋更多結果
-        search_query = f"ytsearch15:{song_name}"  # 增加到15個結果
+        search_query = f"ytsearch15:{song_name}"
         command = f'yt-dlp {extra_params} --dump-json "{search_query}"'
-
+        
         result = subprocess.run(command, shell=True, capture_output=True, text=True)
-
+        
         if result.returncode != 0:
             print(f"搜尋失敗: {result.stderr}")
             return None
-
+            
         videos = []
         for line in result.stdout.strip().split('\n'):
             if line:
                 try:
                     video_info = json.loads(line)
                     duration = video_info.get('duration', 0)
-
-                    # 過濾條件：排除少於1分鐘和超過20分鐘的影片
-                    if duration < 60 or duration > 1200:  # 60秒=1分鐘, 1200秒=20分鐘
+                    
+                    # 過濾條件：排除少於30秒和超過30分鐘的影片
+                    if duration < 30 or duration > 1800:
                         continue
-
+                        
                     videos.append({
                         'title': video_info.get('title', '未知標題'),
                         'url': video_info.get('webpage_url', ''),
@@ -414,47 +462,41 @@ def select_from_search_results(song_name, extra_params=""):
                     })
                 except json.JSONDecodeError:
                     continue
-
+                    
         if not videos:
-            print("找不到符合時長要求的相關影片!")
+            print("找不到相關影片!")
             return None
-
-        # 依照觀看次數排序
-        videos.sort(key=lambda x: x['view_count'], reverse=True)
-
-        # 顯示搜尋結果
-        print("\n找到以下符合時長要求的影片 (1分鐘 ~ 20分鐘):")
-        for i, video in enumerate(videos, 1):
+            
+        # 顯示搜尋結果供用戶選擇
+        print("\n請從以下結果中選擇一個影片:")
+        for i, video in enumerate(videos[:10], 1):  # 只顯示前10個結果
             print(f"{i}. {video['title']} - {video['channel']} ({video['view_count_text']} 觀看次數, {video['duration_text']})")
-
-        # 讓使用者選擇
-        while True:
-            try:
-                choice = input("\n請選擇要下載的影片編號 (或輸入 0 取消): ")
-                if choice == '0':
-                    return None
-
-                choice_idx = int(choice) - 1
-                if 0 <= choice_idx < len(videos):
-                    selected = videos[choice_idx]
-                    print(f"\n已選擇: {selected['title']} ({selected['duration_text']})")
-                    return selected['url']
-                else:
-                    print("無效的選擇，請輸入正確的編號")
-            except ValueError:
-                print("請輸入數字")
-
+            
+        selection = input("\n請輸入編號選擇影片 (輸入0取消): ")
+        try:
+            selection = int(selection)
+            if selection > 0 and selection <= len(videos):
+                selected_video = videos[selection-1]
+                print(f"\n您選擇了: {selected_video['title']}")
+                return selected_video['url']
+            else:
+                print("已取消選擇")
+                return None
+        except ValueError:
+            print("無效的輸入，已取消選擇")
+            return None
+            
     except Exception as e:
-        print(f"搜尋時發生錯誤: {str(e)}")
+        print(f"處理搜尋結果時發生錯誤: {str(e)}")
         return None
 
-# 透過歌曲名稱下載 (改進版)
+# 新增: 下載歌曲函數
 def download_song_by_name(extra_params=""):
     while True:
         song_name = input("請輸入歌曲名稱 (輸入 '0' 退出): ")
         if song_name.lower() == '0':
             break
-
+            
         print("1. 自動選擇最佳結果 (優先選擇完整版)")
         print("2. 手動從搜尋結果中選擇")
         selection_mode = input("請選擇模式 (1/2): ")
@@ -479,7 +521,7 @@ def download_song_by_name(extra_params=""):
             download_as_mp3(url, custom_name, extra_params)
         else:
             print("無法找到合適的歌曲，請嘗試更具體的歌名或歌手名稱")
-
+            
     print("程式已結束")
 
 # 批次下載多首歌曲 (改進版)
@@ -520,14 +562,7 @@ def batch_download_songs(extra_params=""):
             url = search_song(song, prefer_full=prefer_full, extra_params=extra_params)
 
         if url:
-            # 詢問是否要自定義檔名
-            custom_name = input(f"請輸入「{song}」的自定義檔名 (直接按Enter則使用原檔名): ")
-            
-            # 若輸入為空白，則傳入None表示使用原檔名
-            if custom_name.strip() == "":
-                custom_name = None
-            
-            if download_as_mp3(url, custom_name, extra_params):
+            if download_as_mp3(url, extra_params):
                 success_count += 1
         else:
             print(f"無法找到歌曲: {song}")
@@ -542,15 +577,8 @@ def download_by_url(extra_params=""):
             break
 
         if "youtube.com" in youtube_url or "youtu.be" in youtube_url:
-            # 直接詢問檔名，若為空白則不修改
-            custom_name = input("請輸入自定義檔名 (直接按Enter則使用原檔名): ")
-            
-            # 若輸入為空白，則傳入None表示使用原檔名
-            if custom_name.strip() == "":
-                custom_name = None
-                
-            # 下載歌曲
-            download_as_mp3(youtube_url, custom_name, extra_params)
+            # 下載歌曲，不再提前詢問檔名
+            download_as_mp3(youtube_url, extra_params)
         else:
             print("請輸入有效的 YouTube 網址!")
 
@@ -581,14 +609,7 @@ def batch_download_urls(extra_params=""):
     for i, url in enumerate(urls, 1):
         print(f"\n處理第 {i}/{len(urls)} 個影片:")
         
-        # 詢問是否要自定義檔名
-        custom_name = input(f"請輸入第 {i} 個影片的自定義檔名 (直接按Enter則使用原檔名): ")
-        
-        # 若輸入為空白，則傳入None表示使用原檔名
-        if custom_name.strip() == "":
-            custom_name = None
-            
-        if download_as_mp3(url, custom_name, extra_params):
+        if download_as_mp3(url, extra_params):
             success_count += 1
 
     print(f"\n下載完成! 成功: {success_count}/{len(urls)}")

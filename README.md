@@ -20,4 +20,4 @@ yt_mp3_downloader02.py
 6. 變更儲存目錄
 0. 退出程式
 
-刪除這個--embed-thumbnail，將不再包含縮圖
+

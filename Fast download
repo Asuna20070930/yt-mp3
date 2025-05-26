@@ -1,0 +1,809 @@
+import os
+import re
+import json
+import subprocess
+import glob
+import time
+import platform
+import random
+from datetime import datetime
+from google.colab import drive
+from google.auth import default
+from mutagen.mp3 import MP3
+from mutagen.id3 import ID3, TALB, TPE1, TIT2, TCON, TDRC
+import docx
+import shutil
+import gspread
+import pandas as pd
+
+drive.mount('/content/drive')
+
+music_dir = "/content/drive/My Drive/MUSIC"
+spreadsheet_name = "音樂資料庫"
+output_dir = music_dir
+cache_dir = "/content/yt_dlp_cache"
+report_path = f"{music_dir}/download_report.docx"
+
+category_folders = {
+    "中文歌": os.path.join(music_dir, "中文歌"),
+    "日文歌": os.path.join(music_dir, "日文歌"),
+    "英文歌": os.path.join(music_dir, "英文歌"),
+    "純音樂": os.path.join(music_dir, "純音樂")
+}
+
+os.makedirs(output_dir, exist_ok=True)
+os.makedirs(cache_dir, exist_ok=True)
+
+for category, folder_path in category_folders.items():
+    os.makedirs(folder_path, exist_ok=True)
+    print(f"確保資料夾存在: {folder_path}")
+
+def setup_google_sheets():
+    """設定 Google Sheets 認證"""
+    try:
+        creds, _ = default()
+        gc = gspread.authorize(creds)
+        return gc
+    except Exception as e:
+        print(f"Google Sheets 認證失敗: {str(e)}")
+        print("請確保已在 Colab 中授權 Google Drive 存取權限")
+        return None
+
+def setup_download_interval():
+    """設定下載之間的等待時間間隔"""
+    print("\n=== 下載間隔設定 ===")
+    print("為了避免YouTube的速率限制，建議在下載之間設定等待時間")
+    print("1. 保守設定：30-60秒間隔（推薦）")
+    print("2. 中等設定：15-30秒間隔")
+    print("3. 激進設定：5-15秒間隔（可能遇到限制）")
+    print("4. 自定義設定")
+
+    choice = input("請選擇間隔設定 (1/2/3/4): ").strip()
+
+    if choice == "1":
+        return 30, 60
+    elif choice == "2":
+        return 15, 30
+    elif choice == "3":
+        return 5, 15
+    elif choice == "4":
+        try:
+            min_interval = int(input("請輸入最小間隔時間（秒）: "))
+            max_interval = int(input("請輸入最大間隔時間（秒）: "))
+            if min_interval <= 0 or max_interval <= 0 or min_interval > max_interval:
+                print("無效輸入，使用預設值（30-60秒）")
+                return 30, 60
+            return min_interval, max_interval
+        except ValueError:
+            print("無效輸入，使用預設值（30-60秒）")
+            return 30, 60
+    else:
+        print("無效選擇，使用預設值（30-60秒）")
+        return 30, 60
+
+def read_google_sheet(gc, sheet_name, worksheet_name=None, handle_duplicate_headers=False):
+    """讀取 Google 試算表數據（處理重複標題問題）"""
+    try:
+        sheet = gc.open(sheet_name)
+        print(f"成功開啟試算表: {sheet_name}")
+
+        worksheets = sheet.worksheets()
+        print(f"可用的工作表: {[ws.title for ws in worksheets]}")
+
+        if worksheet_name:
+            try:
+                worksheet = sheet.worksheet(worksheet_name)
+                print(f"選擇工作表: {worksheet_name}")
+            except gspread.WorksheetNotFound:
+                print(f"找不到工作表 '{worksheet_name}', 使用第一個工作表")
+                worksheet = sheet.sheet1
+        else:
+            worksheet = sheet.sheet1
+            print(f"使用第一個工作表: {worksheet.title}")
+
+        if handle_duplicate_headers:
+            print("使用原始數據方式讀取（處理重複標題）...")
+            all_values = worksheet.get_all_values()
+            if not all_values:
+                print("工作表為空")
+                return pd.DataFrame()
+
+            headers = all_values[0]
+            processed_headers = []
+            header_count = {}
+
+            for header in headers:
+                if header in header_count:
+                    header_count[header] += 1
+                    processed_headers.append(f"{header}_{header_count[header]}")
+                else:
+                    header_count[header] = 0
+                    processed_headers.append(header)
+
+            data_rows = all_values[1:]
+            df = pd.DataFrame(data_rows, columns=processed_headers)
+
+            print(f"成功讀取試算表（原始方式），共 {len(df)} 行數據")
+            print(f"處理後的欄位: {list(df.columns)}")
+
+        else:
+            data = worksheet.get_all_records()
+            df = pd.DataFrame(data)
+            print(f"成功讀取試算表，共 {len(df)} 行數據")
+            print(f"欄位: {list(df.columns)}")
+
+        return df
+
+    except gspread.SpreadsheetNotFound:
+        print(f"找不到名為 '{sheet_name}' 的試算表")
+        print("請確認試算表名稱是否正確，或者試算表是否已與您的 Google 帳戶共享")
+        return None
+    except Exception as e:
+        print(f"讀取 Google 試算表時發生錯誤: {str(e)}")
+        if "not unique" in str(e):
+            print("檢測到重複標題，嘗試使用原始數據方式重新讀取...")
+            return read_google_sheet(gc, sheet_name, worksheet_name, handle_duplicate_headers=True)
+        return None
+
+def get_file_size(file_path):
+    """獲取文件大小並轉換為可讀格式和原始字節數"""
+    try:
+        size_bytes = os.path.getsize(file_path)
+        if size_bytes < 1024:
+            return f"{size_bytes} B", size_bytes
+        elif size_bytes < 1024 * 1024:
+            return f"{size_bytes / 1024:.2f} KB", size_bytes
+        elif size_bytes < 1024 * 1024 * 1024:
+            return f"{size_bytes / (1024 * 1024):.2f} MB", size_bytes
+        else:
+            return f"{size_bytes / (1024 * 1024 * 1024):.2f} GB", size_bytes
+    except Exception as e:
+        print(f"獲取文件大小時發生錯誤: {str(e)}")
+        return "未知大小", 0
+
+def parse_duration(duration_str):
+    """將時長字符串轉換為秒數"""
+    try:
+        if not duration_str or duration_str == "未知時長" or str(duration_str) == 'nan':
+            return 0
+
+        duration_str = str(duration_str).strip()
+        parts = duration_str.split(':')
+        if len(parts) == 2:
+            return int(parts[0]) * 60 + int(parts[1])
+        elif len(parts) == 3:
+            return int(parts[0]) * 3600 + int(parts[1]) * 60 + int(parts[2])
+        else:
+            return 0
+    except Exception as e:
+        print(f"解析時長時發生錯誤: {str(e)}")
+        return 0
+
+def parse_file_size(size_str):
+    """將文件大小字符串轉換為字節數"""
+    try:
+        if not size_str or size_str == "未知大小" or str(size_str) == 'nan':
+            return 0
+
+        size_str = str(size_str).strip()
+        if 'B' in size_str and not ('KB' in size_str or 'MB' in size_str or 'GB' in size_str):
+            return float(size_str.replace('B', '').strip())
+        elif 'KB' in size_str:
+            return float(size_str.replace('KB', '').strip()) * 1024
+        elif 'MB' in size_str:
+            return float(size_str.replace('MB', '').strip()) * 1024 * 1024
+        elif 'GB' in size_str:
+            return float(size_str.replace('GB', '').strip()) * 1024 * 1024 * 1024
+        else:
+            return 0
+    except Exception as e:
+        print(f"解析文件大小時發生錯誤: {str(e)}")
+        return 0
+
+def format_duration(seconds):
+    """將秒數轉換為時分秒格式"""
+    minutes, seconds = divmod(seconds, 60)
+    hours, minutes = divmod(minutes, 60)
+
+    if hours > 0:
+        return f"{hours}:{minutes:02d}:{seconds:02d}"
+    else:
+        return f"{minutes}:{seconds:02d}"
+
+def get_mp3_metadata(file_path):
+    """獲取MP3文件的元數據"""
+    try:
+        audio = MP3(file_path, ID3=ID3)
+        if audio.tags is None:
+            return None
+
+        metadata = {
+            'title': str(audio.tags.get('TIT2', '未知標題')),
+            'artist': str(audio.tags.get('TPE1', '未知藝術家')),
+            'album': str(audio.tags.get('TALB', '未知專輯')),
+            'year': str(audio.tags.get('TDRC', '未知年份')),
+            'genre': str(audio.tags.get('TCON', '未知類型')),
+            'duration': format_duration(int(audio.info.length))
+        }
+        return metadata
+    except Exception as e:
+        print(f"讀取ID3標籤時發生錯誤: {str(e)}")
+        return None
+
+def sanitize_filename(filename):
+    """清理檔案名稱，移除不合法字元"""
+    return re.sub(r'[\\/*?:"<>|]', "_", filename)
+
+def get_category_folder(category):
+    """根據類別字串取得對應的資料夾路徑"""
+    category = str(category).strip()
+    
+    if not category or category == 'nan' or category == '':
+        print(f"警告: 類別為空，將檔案放到主目錄")
+        return music_dir
+    
+    # 完全匹配
+    if category in category_folders:
+        return category_folders[category]
+    
+    # 部分匹配
+    for cat_name, folder_path in category_folders.items():
+        if cat_name in category or category in cat_name:
+            return folder_path
+    
+    print(f"警告: 未知的類別 '{category}', 將檔案放到主目錄")
+    return music_dir
+
+def move_to_category_folder(file_path, category):
+    """將檔案移動到對應的類別資料夾"""
+    try:
+        target_folder = get_category_folder(category)
+        filename = os.path.basename(file_path)
+        target_path = os.path.join(target_folder, filename)
+
+        # 如果目標檔案已存在，添加編號
+        if os.path.exists(target_path):
+            base_name, ext = os.path.splitext(filename)
+            counter = 1
+            while os.path.exists(os.path.join(target_folder, f"{base_name}_{counter}{ext}")):
+                counter += 1
+            target_path = os.path.join(target_folder, f"{base_name}_{counter}{ext}")
+
+        shutil.move(file_path, target_path)
+        print(f"檔案已移動到 {category} 資料夾: {os.path.basename(target_path)}")
+        return target_path
+        
+    except Exception as e:
+        print(f"移動檔案到類別資料夾時發生錯誤: {str(e)}")
+        return file_path
+
+def check_existing_file_in_category(filename, category):
+    """檢查指定類別資料夾中是否已存在同名檔案"""
+    target_folder = get_category_folder(category)
+    target_path = os.path.join(target_folder, filename)
+    return target_path if os.path.exists(target_path) else None
+
+def setup_cookies():
+    """設置cookies以避免429錯誤"""
+    print("正在設置cookies以避免YouTube限制...")
+
+    print("\n解決YouTube 429錯誤的方法:")
+    print("1. 使用代理IP（減緩請求速率）")
+    print("2. 手動設置User-Agent（模擬不同瀏覽器）")
+    print("3. 手動輸入YouTube cookies（最有效但需要用戶操作）")
+
+    choice = input("請選擇處理方式 (1/2/3): ")
+    cookies_file = f"{cache_dir}/youtube_cookies.txt"
+
+    if choice == "1":
+        return "--socket-timeout 30 --sleep-interval 5 --max-sleep-interval 10 --retries 10"
+    elif choice == "2":
+        ua_options = [
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/119.0.0.0 Safari/537.36",
+            "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/16.5 Safari/605.1.15",
+            "Mozilla/5.0 (X11; Linux x86_64; rv:109.0) Gecko/20100101 Firefox/117.0"
+        ]
+        print("\n請選擇User-Agent:")
+        for i, ua in enumerate(ua_options, 1):
+            print(f"{i}. {ua}")
+
+        ua_choice = input("請選擇 (1/2/3): ")
+        try:
+            user_agent = ua_options[int(ua_choice) - 1]
+            return f"--user-agent \"{user_agent}\""
+        except:
+            print("無效選擇，使用默認User-Agent")
+            return ""
+    elif choice == "3":
+        print("\n== 如何提供YouTube cookies ==")
+        print("1. 在瀏覽器中登入YouTube")
+        print("2. 安裝Cookie Editor瀏覽器擴展")
+        print("3. 前往YouTube網站，開啟Cookie Editor")
+        print("4. 點擊「Export」按鈕，選擇「Export as Netscape HTTP Cookie File」")
+        print("5. 將內容複製並貼上到下方")
+        print("\n請貼上從Cookie Editor擴展匯出的cookies內容（貼上後按Enter再按Ctrl+D結束輸入）:")
+
+        cookies_content = []
+        while True:
+            try:
+                line = input()
+                cookies_content.append(line)
+            except EOFError:
+                break
+
+        with open(cookies_file, 'w', encoding='utf-8') as f:
+            f.write('\n'.join(cookies_content))
+
+        if os.path.exists(cookies_file) and os.path.getsize(cookies_file) > 0:
+            print("成功保存cookies!")
+            return f"--cookies \"{cookies_file}\""
+        else:
+            print("cookies似乎為空，將嘗試不使用cookies")
+            return ""
+    else:
+        print("無效選擇，不使用特殊參數")
+        return ""
+
+def test_youtube_connection(extra_params):
+    """測試與YouTube的連接，檢查是否能夠正常訪問"""
+    print("測試與YouTube的連接...")
+
+    test_cmd = f'yt-dlp --dump-json "ytsearch1:test" {extra_params}'
+    result = subprocess.run(test_cmd, shell=True, capture_output=True, text=True)
+
+    if result.returncode == 0:
+        print("✅ YouTube連接正常!")
+        return True
+    else:
+        if "429" in result.stderr:
+            print("❌ 仍然出現429錯誤，可能需要使用更有效的cookies或等待一段時間再試")
+        elif "Unable to download webpage" in result.stderr:
+            print("❌ 無法連接到YouTube，請檢查網絡連接")
+        else:
+            print(f"❌ 連接測試失敗: {result.stderr}")
+        return False
+
+def download_mp3(youtube_url, target_filename, extra_params=""):
+    """從YouTube URL下載MP3，並重命名為目標檔名"""
+    try:
+        print(f"正在從 {youtube_url} 下載...")
+
+        temp_output = f"{output_dir}/temp_download_%(title)s.%(ext)s"
+
+        command = f'yt-dlp {extra_params} --no-playlist -x --audio-format mp3 --audio-quality 0 --add-metadata --no-embed-thumbnail --no-write-thumbnail -o "{temp_output}" "{youtube_url}"'
+
+        result = subprocess.run(command, shell=True, capture_output=True, text=True)
+
+        if result.returncode != 0:
+            if "429" in result.stderr:
+                print(f"下載失敗: 遇到429錯誤 (Too Many Requests)")
+                return None, "429 Error"
+            else:
+                print(f"下載失敗: {result.stderr}")
+                return None, result.stderr
+
+        temp_files = glob.glob(f"{output_dir}/temp_download_*.mp3")
+        if not temp_files:
+            print("下載後找不到臨時檔案")
+            return None, "No file found after download"
+
+        temp_file = max(temp_files, key=os.path.getctime)
+
+        target_file_path = f"{output_dir}/{sanitize_filename(target_filename)}"
+        if not target_file_path.lower().endswith('.mp3'):
+            target_file_path += '.mp3'
+
+        if os.path.exists(target_file_path):
+            base_name = target_file_path[:-4]
+            counter = 1
+            while os.path.exists(f"{base_name}_{counter}.mp3"):
+                counter += 1
+            target_file_path = f"{base_name}_{counter}.mp3"
+
+        os.rename(temp_file, target_file_path)
+        print(f"下載完成，已保存為: {os.path.basename(target_file_path)}")
+
+        return target_file_path, None
+
+    except Exception as e:
+        print(f"下載過程中發生錯誤: {str(e)}")
+        return None, str(e)
+
+def create_or_update_report(items):
+    """創建或更新Word報告文件，記錄所有相關資訊"""
+    try:
+        if not items:
+            print("沒有需要寫入報告的項目")
+            return
+
+        doc = docx.Document()
+        doc.add_heading('音樂下載報告', 0)
+        doc.add_paragraph(f"生成時間: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+        doc.add_paragraph('')
+        doc.add_heading('429錯誤處理指南', level=1)
+        doc.add_paragraph('如果遇到429錯誤 (Too Many Requests)，請嘗試以下解決方案:')
+        p = doc.add_paragraph()
+        p.add_run('1. ').bold = True
+        p.add_run('等待一段時間（通常15-30分鐘）後再試')
+        p = doc.add_paragraph()
+        p.add_run('2. ').bold = True
+        p.add_run('使用YouTube帳戶的cookies（最有效的方法）')
+        p = doc.add_paragraph()
+        p.add_run('3. ').bold = True
+        p.add_run('更換網絡環境或使用VPN')
+        p = doc.add_paragraph()
+        p.add_run('4. ').bold = True
+        p.add_run('減少短時間內的下載次數')
+        doc.add_paragraph('')
+        doc.add_heading('類別資料夾配置', level=1)
+        doc.add_paragraph('檔案會根據試算表中的「類別」欄位自動分類到以下資料夾:')
+        for category, folder_path in category_folders.items():
+            p = doc.add_paragraph()
+            p.add_run(f'{category}: ').bold = True
+            p.add_run(folder_path)
+        doc.add_paragraph('')
+        doc.add_heading('下載處理結果', level=1)
+
+        for item in items:
+            doc.add_heading(f"檔案: {item['filename']}", level=2)
+
+            p = doc.add_paragraph()
+            p.add_run('YouTube網址: ').bold = True
+            p.add_run(item['url'])
+
+            p = doc.add_paragraph()
+            p.add_run('處理結果: ').bold = True
+            p.add_run(item['status'])
+
+            if 'category' in item:
+                p = doc.add_paragraph()
+                p.add_run('類別: ').bold = True
+                p.add_run(item['category'])
+
+            if item['status'] == '下載成功':
+                p = doc.add_paragraph()
+                p.add_run('最終檔案位置: ').bold = True
+                p.add_run(item.get('final_file', item['new_file']))
+
+                if 'original_file' in item and item['original_file']:
+                    p = doc.add_paragraph()
+                    p.add_run('原始文件: ').bold = True
+                    p.add_run(item['original_file'])
+
+                    if 'action' in item:
+                        p = doc.add_paragraph()
+                        p.add_run('執行動作: ').bold = True
+                        p.add_run(item['action'])
+
+                        if item['action'] == '保留兩個文件':
+                            p = doc.add_paragraph()
+                            p.add_run('原因: ').bold = True
+                            p.add_run(item['reason'])
+            elif item['status'] == '下載失敗':
+                p = doc.add_paragraph()
+                p.add_run('錯誤訊息: ').bold = True
+                p.add_run(item['error_message'])
+
+            doc.add_paragraph('')
+
+        # 保存文檔
+        doc.save(report_path)
+        print(f"報告已生成並保存到: {report_path}")
+
+    except Exception as e:
+        print(f"創建報告時發生錯誤: {str(e)}")
+
+def detect_columns(df, worksheet_type="main"):
+    """根據工作表類型檢測欄位"""
+    column_mapping = {}
+    columns = list(df.columns)
+
+    print(f"試算表欄位: {columns}")
+
+    if worksheet_type == "main":
+        if len(columns) >= 10:
+            column_mapping['序號'] = columns[0]
+            column_mapping['日期時間'] = columns[1]
+            column_mapping['filename'] = columns[2]
+            column_mapping['url'] = columns[3]   
+            column_mapping['歌曲標題'] = columns[4]
+            column_mapping['藝術家'] = columns[5]
+            column_mapping['專輯'] = columns[6]
+            column_mapping['duration'] = columns[7]
+            column_mapping['size'] = columns[8]
+            column_mapping['category'] = columns[9]
+        elif len(columns) >= 9:
+            column_mapping['序號'] = columns[0]
+            column_mapping['日期時間'] = columns[1]
+            column_mapping['filename'] = columns[2]
+            column_mapping['url'] = columns[3]   
+            column_mapping['歌曲標題'] = columns[4]
+            column_mapping['藝術家'] = columns[5]
+            column_mapping['專輯'] = columns[6]
+            column_mapping['duration'] = columns[7]
+            column_mapping['size'] = columns[8]
+            print("警告: 未找到類別欄位，檔案將儲存到主目錄")
+        else:
+            print("警告: 主資料庫欄位數量不足")
+    elif worksheet_type == "downloaded":
+        if len(columns) >= 2:
+            filename_patterns = ['檔案名稱', '檔名', 'filename', 'name', '名稱']
+
+            for i, col in enumerate(columns):
+                for pattern in filename_patterns:
+                    if pattern in col.lower():
+                        column_mapping['filename'] = columns[i]
+                        break
+                if 'filename' in column_mapping:
+                    break
+
+            if 'filename' not in column_mapping and len(columns) >= 2:
+                column_mapping['filename'] = columns[1]
+
+            if 'filename' not in column_mapping:
+                column_mapping['filename'] = columns[0]
+
+    if not column_mapping:
+        print("使用通用欄位檢測...")
+        url_patterns = ['url', '網址', 'youtube', 'link', '連結', 'youtube網址', 'youtube_url']
+        filename_patterns = ['filename', '檔名', '檔案名稱', 'name', '名稱', 'title', '標題']
+
+        columns_lower = [col.lower() for col in columns]
+
+        for pattern in url_patterns:
+            for i, col in enumerate(columns_lower):
+                if pattern in col:
+                    column_mapping['url'] = columns[i]
+                    break
+            if 'url' in column_mapping:
+                break
+
+        for pattern in filename_patterns:
+            for i, col in enumerate(columns_lower):
+                if pattern in col:
+                    column_mapping['filename'] = columns[i]
+                    break
+            if 'filename' in column_mapping:
+                break
+
+    return column_mapping
+
+# 主函數
+def main():
+    print("=== YouTube 音樂重新下載工具（Google 試算表版本）===")
+    print(f"音樂儲存路徑: {output_dir}")
+    print(f"試算表名稱: {spreadsheet_name}")
+    print(f"報告輸出路徑: {report_path}")
+    print()
+
+    gc = setup_google_sheets()
+    if not gc:
+        print("無法設定 Google Sheets 連接，程式結束")
+        return
+
+    main_df = read_google_sheet(gc, spreadsheet_name, "下載記錄")
+    if main_df is None:
+        print("無法讀取主要音樂資料庫工作表，程式結束")
+        return
+
+    downloaded_df = read_google_sheet(gc, spreadsheet_name, "確認已下載")
+    if downloaded_df is None:
+        print("無法讀取「確認已下載」工作表，將繼續處理主資料庫")
+        downloaded_df = pd.DataFrame()
+
+    main_column_mapping = detect_columns(main_df)
+
+    print("\n主資料庫檢測到的欄位:")
+    for key, value in main_column_mapping.items():
+        print(f"  {key}: {value}")
+
+    if 'url' not in main_column_mapping or 'filename' not in main_column_mapping:
+        print("\n❌ 錯誤: 無法找到必要的欄位（URL 和檔名）")
+        print("\n請確保試算表包含正確的欄位順序:")
+        print("0: 序號 1: 日期時間 2: 檔案名稱 3: YouTube網址 4: 歌曲標題 5: 藝術家 6: 專輯 7: 時長 8: 文件大小 9: 類別")
+        return
+
+    min_interval, max_interval = setup_download_interval()
+
+    extra_params = setup_cookies()
+
+    if not test_youtube_connection(extra_params):
+        print("警告: YouTube連接測試失敗，可能會影響下載過程")
+
+    try:
+        rows_to_process = []
+        processed_urls = set()
+
+        downloaded_filenames = set()
+        if not downloaded_df.empty and 'filename' in detect_columns(downloaded_df):
+            downloaded_column_mapping = detect_columns(downloaded_df)
+            downloaded_filenames = set(str(filename).strip() for filename in downloaded_df[downloaded_column_mapping['filename']] if str(filename).strip())
+            print(f"\n已下載檔案數量: {len(downloaded_filenames)}")
+
+        for index, row in main_df.iterrows():
+            youtube_url = str(row[main_column_mapping['url']]).strip()
+            filename = str(row[main_column_mapping['filename']]).strip()
+
+            if not youtube_url or youtube_url == 'nan' or youtube_url in processed_urls:
+                continue
+
+            if filename in downloaded_filenames:
+                print(f"跳過已確認下載的檔案: {filename}")
+                continue
+
+            duration = str(row[main_column_mapping['duration']]) if 'duration' in main_column_mapping else ""
+            file_size = str(row[main_column_mapping['size']]) if 'size' in main_column_mapping else ""
+            category = str(row[main_column_mapping['category']]) if 'category' in main_column_mapping else ""
+
+            rows_to_process.append({
+                'index': index + 1,
+                'url': youtube_url,
+                'filename': filename,
+                'duration': duration,
+                'file_size': file_size,
+                'category': category
+            })
+
+            processed_urls.add(youtube_url)
+
+        print(f"\n找到 {len(rows_to_process)} 條需要處理的記錄")
+
+        if len(rows_to_process) == 0:
+            print("所有音樂檔案都已確認下載，無需處理")
+            return
+
+        choice = input("是否繼續下載? (y/n): ")
+        if choice.lower() != 'y':
+            print("操作已取消")
+            return
+
+        report_items = []
+
+        for i, item in enumerate(rows_to_process, 1):
+            print(f"\n[{i}/{len(rows_to_process)}] 處理項目: {item['filename']}")
+            print(f"URL: {item['url']}")
+            print(f"類別: {item['category']}")
+
+            target_filename = item['filename']
+            if not target_filename.lower().endswith('.mp3'):
+                target_filename += '.mp3'
+
+            # 檢查各個類別資料夾是否已有同名檔案
+            existing_file_path = None
+            existing_file_exists = False
+            
+            # 先檢查主目錄
+            main_file_path = os.path.join(output_dir, target_filename)
+            if os.path.exists(main_file_path):
+                existing_file_path = main_file_path
+                existing_file_exists = True
+                print(f"發現主目錄中的同名檔案: {target_filename}")
+            
+            # 檢查各類別資料夾
+            for category_name, category_path in category_folders.items():
+                category_file_path = os.path.join(category_path, target_filename)
+                if os.path.exists(category_file_path):
+                    existing_file_path = category_file_path
+                    existing_file_exists = True
+                    print(f"發現 {category_name} 資料夾中的同名檔案: {target_filename}")
+                    break
+
+            if existing_file_exists:
+                existing_metadata = get_mp3_metadata(existing_file_path)
+                existing_duration = existing_metadata['duration'] if existing_metadata else "未知時長"
+                existing_size_str, existing_size_bytes = get_file_size(existing_file_path)
+
+                print(f"現有檔案 - 時長: {existing_duration}, 大小: {existing_size_str}")
+                print(f"試算表記錄 - 時長: {item['duration']}, 大小: {item['file_size']}")
+
+            new_file_path, error = download_mp3(item['url'], f"temp_{item['filename']}", extra_params)
+
+            report_item = {
+                'filename': item['filename'],
+                'url': item['url'],
+                'category': item['category']
+            }
+
+            if new_file_path:
+                print("下載成功!")
+                report_item['status'] = '下載成功'
+                
+                final_file_path = new_file_path
+
+                if existing_file_exists:
+                    new_metadata = get_mp3_metadata(new_file_path)
+                    new_duration = new_metadata['duration'] if new_metadata else "未知時長"
+                    new_size_str, new_size_bytes = get_file_size(new_file_path)
+
+                    print(f"新檔案 - 時長: {new_duration}, 大小: {new_size_str}")
+
+                    existing_duration_sec = parse_duration(existing_duration)
+                    new_duration_sec = parse_duration(new_duration)
+
+                    if existing_duration_sec != new_duration_sec:
+                        # 時長不同，保留兩個文件
+                        backup_filename = f"{item['filename']}_new.mp3"
+                        backup_path = os.path.join(output_dir, backup_filename)
+                        os.rename(new_file_path, backup_path)
+                        
+                        # 將新文件移動到類別資料夾
+                        final_file_path = move_to_category_folder(backup_path, item['category'])
+
+                        print(f"時長不同，保留兩個文件: 原始={existing_duration}, 新={new_duration}")
+                        report_item['original_file'] = existing_file_path
+                        report_item['action'] = '保留兩個文件'
+                        report_item['reason'] = f"時長不同：原始={existing_duration}, 新={new_duration}"
+                        report_item['final_file'] = final_file_path
+                    else:
+                        if new_size_bytes > existing_size_bytes:
+                            try:
+                                # 備份原始文件
+                                original_backup = os.path.join(os.path.dirname(existing_file_path), f"{item['filename']}_original.mp3")
+                                shutil.copy2(existing_file_path, original_backup)
+                                os.remove(existing_file_path)
+                                
+                                # 重命名新文件為原始檔名並移動到類別資料夾
+                                temp_final_path = os.path.join(output_dir, target_filename)
+                                os.rename(new_file_path, temp_final_path)
+                                final_file_path = move_to_category_folder(temp_final_path, item['category'])
+
+                                print(f"新文件較大，已覆蓋原始文件 (已備份原始文件)")
+                                report_item['original_file'] = existing_file_path
+                                report_item['action'] = '覆蓋原始文件'
+                                report_item['reason'] = f"新文件較大：原始={existing_size_str}, 新={new_size_str}"
+                                report_item['final_file'] = final_file_path
+                            except Exception as e:
+                                print(f"覆蓋文件時發生錯誤: {str(e)}")
+                                report_item['error_message'] = f"覆蓋文件時發生錯誤: {str(e)}"
+                        else:
+                            try:
+                                print(f"原始文件較大或相同大小，保留原始文件")
+                                os.remove(new_file_path)
+
+                                report_item['original_file'] = existing_file_path
+                                report_item['action'] = '保留原始文件'
+                                report_item['reason'] = f"原始文件較大或相同：原始={existing_size_str}, 新={new_size_str}"
+                                report_item['final_file'] = existing_file_path
+                            except Exception as e:
+                                print(f"移除新文件時發生錯誤: {str(e)}")
+                                report_item['error_message'] = f"移除新文件時發生錯誤: {str(e)}"
+                else:
+                    # 沒有現有檔案，直接重命名並移動到類別資料夾
+                    temp_final_path = os.path.join(output_dir, target_filename)
+                    os.rename(new_file_path, temp_final_path)
+                    final_file_path = move_to_category_folder(temp_final_path, item['category'])
+                    
+                    print(f"檔案已儲存到 {item['category']} 資料夾: {os.path.basename(final_file_path)}")
+                    report_item['final_file'] = final_file_path
+
+            else:
+                print(f"下載失敗: {error}")
+                report_item['status'] = '下載失敗'
+                report_item['error_message'] = error
+
+            report_items.append(report_item)
+
+            # 等待間隔
+            if i < len(rows_to_process):
+                wait_time = random.randint(min_interval, max_interval)
+                print(f"等待 {wait_time} 秒後繼續下一個下載...")
+
+                for remaining in range(wait_time, 0, -1):
+                    print(f"\r剩餘等待時間: {remaining} 秒", end="", flush=True)
+                    time.sleep(1)
+                print("\r" + " " * 20 + "\r", end="")
+
+        create_or_update_report(report_items)
+
+        print("\n全部處理完成!")
+        print("\n各類別資料夾檔案統計:")
+        for category, folder_path in category_folders.items():
+            if os.path.exists(folder_path):
+                file_count = len([f for f in os.listdir(folder_path) if f.endswith('.mp3')])
+                print(f"  {category}: {file_count} 個檔案")
+
+    except Exception as e:
+        print(f"程式執行時發生錯誤: {str(e)}")
+
+if __name__ == "__main__":
+    main()
